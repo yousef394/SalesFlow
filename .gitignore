@@ -1,0 +1,40 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+sales-env/
+prediction_outputs/
+ml_outputs/
+*.log
+archive.zip
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Airflow generated files
+config/airflow.cfg
+logs/
+plugins/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+
+# Generated ML outputs
+ml_outputs/
+prediction_outputs/
+
+# Database backups
+*backup*
+*Backup*
+*.sql.backup
+*.backup
+*.dump
+
+# Local datasets
+data/
+
