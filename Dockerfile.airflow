@@ -1,0 +1,18 @@
+# Airflow image + Java (Spark) + the project's own Python environment.
+FROM apache/airflow:3.4.0
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends default-jre-headless \
+    && rm -rf /var/lib/apt/lists/*
+ENV JAVA_HOME=/usr/lib/jvm/default-java
+# Fail the build now, not the prediction task later, if Java is not where Spark will look.
+RUN test -x "$JAVA_HOME/bin/java" && "$JAVA_HOME/bin/java" -version
+
+USER airflow
+COPY requirements-pipeline.txt /tmp/requirements-pipeline.txt
+# Long timeout, many retries and a build cache: pyspark is ~300 MB, so an interrupted download
+# resumes from the cache on the next `docker compose build` instead of starting over.
+RUN --mount=type=cache,target=/home/airflow/.cache/pip,uid=50000 \
+    python -m venv /home/airflow/salesflow-venv \
+    && /home/airflow/salesflow-venv/bin/pip install --default-timeout=120 --retries 10 -r /tmp/requirements-pipeline.txt

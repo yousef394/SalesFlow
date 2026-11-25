@@ -1,0 +1,11 @@
+# Python environment of the Streamlit dashboard image (no Spark, no Airflow).
+# Versions are the ones already pinned in requirements.txt.
+matplotlib==3.11.2
+numpy==2.4.6
+pandas==3.0.6
+plotly==7.1.0
+psycopg2-binary==2.9.13
+pyarrow==25.0.1
+python-dotenv==1.2.4
+SQLAlchemy==2.0.54
+streamlit==1.64.0

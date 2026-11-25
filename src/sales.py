@@ -8,12 +8,15 @@ CSV_PATH = BASE_DIR / "data" / "Sales_data (1).csv"
 
 
 
-def main():
+def main(df=None):
     """Read the CSV, validate it and build the normalized tables in memory.
 
     Does not touch any database. Returns the tables as a dict of DataFrames.
+    `df` is optional: a caller that has already read the CSV (the Airflow
+    validation task) passes it in so the file is read once per run.
     """
-    df = pd.read_csv(CSV_PATH)
+    if df is None:
+        df = pd.read_csv(CSV_PATH)
     print("CSV columns:")
     print(df.columns.tolist())
     print(df.head())

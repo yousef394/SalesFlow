@@ -49,20 +49,24 @@ x-airflow-common:
   # In order to add custom dependencies or upgrade provider distributions you can use your extended image.
   # Comment the image line, place your Dockerfile in the directory where you placed the docker-compose.yaml
   # and uncomment the "build" line below, Then run `docker-compose build` to build the images.
-  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.4.0}
-  # build: .
+  # Custom image: official Airflow + Java (Spark) + the project's Python environment.
+  # Built with `docker compose build`; nothing is installed when a container starts.
+  image: salesflow-airflow:3.4.0
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
   env_file:
     - ${ENV_FILE_PATH:-.env}
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://airflow:airflow@postgres/airflow
-    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg://airflow:airflow@postgres/airflow
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://airflow:${AIRFLOW_DB_PASSWORD:-airflow}@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg://airflow:${AIRFLOW_DB_PASSWORD:-airflow}@postgres/airflow
     AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
     AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
     AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-airflow_jwt_secret}
     AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
@@ -76,14 +80,26 @@ x-airflow-common:
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
     # The following line can be used to set a custom config file, stored in the local config folder
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+    # --- SalesFlow ---
+    # The pipeline stages import `src.*` from /opt/airflow.
+    PYTHONPATH: /opt/airflow
+    # PostgreSQL runs on the host: DB_USER, DB_PASSWORD, DB_PORT, *_DB_NAME come from .env,
+    # DB_HOST is replaced by the address that reaches the host from inside Docker.
+    DB_HOST: ${DOCKER_DB_HOST:-host.docker.internal}
+    # Worker and dashboard share this folder (forecast.csv, metrics.json, forecast_meta.json).
+    PREDICTION_OUTPUT_DIR: /opt/airflow/prediction_outputs
+    PYSPARK_SUBMIT_ARGS: "--driver-memory ${SPARK_DRIVER_MEMORY:-2g} pyspark-shell"
+    SPARK_LOCAL_IP: 127.0.0.1
+    AIRFLOW__CELERY__WORKER_CONCURRENCY: '4'
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
-    - ./src:/opt/airflow/src
-    - ./sql:/opt/airflow/sql
+    - ./src:/opt/airflow/src:ro
+    - ./sql:/opt/airflow/sql:ro
     - ./data:/opt/airflow/data
+    - ./prediction_outputs:/opt/airflow/prediction_outputs
   extra_hosts:
     - "host.docker.internal:host-gateway"
   user: "${AIRFLOW_UID:-50000}:0"
@@ -99,7 +115,7 @@ services:
     image: postgres:16
     environment:
       POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
       POSTGRES_DB: airflow
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
@@ -262,14 +278,14 @@ services:
         echo
         echo "Creating missing opt dirs if missing:"
         echo
-        mkdir -v -p /opt/airflow/{logs,dags,plugins,config}
+        mkdir -v -p /opt/airflow/{logs,dags,plugins,config,prediction_outputs}
         echo
         echo "Airflow version:"
         /entrypoint airflow version
         echo
         echo "Files in shared volumes:"
         echo
-        ls -la /opt/airflow/{logs,dags,plugins,config}
+        ls -la /opt/airflow/{logs,dags,plugins,config,prediction_outputs}
         echo
         echo "Running airflow config list to create default config file if missing."
         echo
@@ -277,19 +293,15 @@ services:
         echo
         echo "Files in shared volumes:"
         echo
-        ls -la /opt/airflow/{logs,dags,plugins,config}
-        echo
-        echo "Change ownership of files in /opt/airflow to ${AIRFLOW_UID:-50000}:0"
-        echo
-        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/
+        ls -la /opt/airflow/{logs,dags,plugins,config,prediction_outputs}
         echo
         echo "Change ownership of files in shared volumes to ${AIRFLOW_UID:-50000}:0"
         echo
-        chown -v -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{logs,dags,plugins,config}
+        chown -v -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{logs,dags,plugins,config,prediction_outputs}
         echo
         echo "Files in shared volumes:"
         echo
-        ls -la /opt/airflow/{logs,dags,plugins,config}
+        ls -la /opt/airflow/{logs,dags,plugins,config,prediction_outputs}
 
     # yamllint enable rule:line-length
     environment:
@@ -337,6 +349,27 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+
+  # Streamlit dashboard: independent of Airflow. It starts immediately and does not wait for the DAG;
+  # it shows loading states until the views and the forecast of the latest run are ready.
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    image: salesflow-dashboard:latest
+    env_file:
+      - ${ENV_FILE_PATH:-.env}
+    environment:
+      DB_HOST: ${DOCKER_DB_HOST:-host.docker.internal}
+      PREDICTION_OUTPUT_DIR: /app/prediction_outputs
+    volumes:
+      - ./src:/app/src:ro
+      - ./prediction_outputs:/app/prediction_outputs:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
 
 volumes:
   postgres-db-volume:

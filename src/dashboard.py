@@ -5,7 +5,8 @@ from textwrap import dedent
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from src import pipeline_status
 from src.config import get_engine
 
 from src.visuals import (
@@ -407,38 +408,137 @@ def get_dwh_engine():
 
 engine = get_dwh_engine()
 
+# The analytics views are created by the pipeline (its build_views task runs
+# sql/analytics.sql). The dashboard only reads them and never creates them.
+REQUIRED_VIEWS = [
+    "vw_overall_sales_performance",
+    "vw_sales_over_time",
+    "vw_yearly_performance",
+    "vw_category_performance",
+    "vw_subcategory_performance",
+    "vw_product_performance",
+    "vw_manufacturer_performance",
+    "vw_segment_performance",
+    "vw_region_performance",
+    "vw_discount_profitability",
+]
+REQUIRED_TABLES = ["dim_product", "fact_sales"]
 
-@st.cache_data
-def load_view(view_name):
+
+def check_data_ready():
+    """Return (ready, reason). Never raises: a missing view or an unreachable database is a state, not a crash."""
+    try:
+        with engine.connect() as connection:
+            missing = [
+                name
+                for name in REQUIRED_VIEWS + REQUIRED_TABLES
+                if not connection.execute(
+                    text("SELECT to_regclass(:name) IS NOT NULL"), {"name": name}
+                ).scalar()
+            ]
+            if missing:
+                return False, "Waiting for the pipeline to create: " + ", ".join(missing) + "."
+            if not connection.execute(text("SELECT EXISTS (SELECT 1 FROM fact_sales)")).scalar():
+                return False, "The warehouse is still empty."
+    except Exception:
+        return False, "The database is not reachable right now."
+    return True, ""
+
+
+def current_cache_key():
+    """Changes when a new pipeline run has (re)built the views, so cached data never outlives its run."""
+    try:
+        run = pipeline_status.latest_run(engine)
+    except Exception:
+        run = None
+    if run is None:
+        return "no-run"
+    built = run["stages"].get("build_views", {})
+    return f"{run['run_id']}|{built.get('status')}|{built.get('finished_at')}"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_view(view_name, cache_key):
     return pd.read_sql(f"SELECT * FROM {view_name};", engine)
 
 
-def initialize_analytics():
-    BASE_DIR = Path(__file__).resolve().parent.parent
-    analytics_file = BASE_DIR / "sql" / "analytics.sql"
-
-    if not analytics_file.exists():
-        st.error(f"analytics.sql was not found at:\n{analytics_file}")
-        st.stop()
-
-    analytics_sql = analytics_file.read_text(encoding="utf-8")
-
-    with engine.begin() as connection:
-        connection.exec_driver_sql(analytics_sql)
+@st.cache_data(ttl=600, show_spinner=False)
+def load_product_names(cache_key):
+    return pd.read_sql("SELECT product_key, product_name FROM dim_product", engine)
 
 
-initialize_analytics()
+def render_skeleton(kpis=True):
+    cards = "".join('<div class="sk" style="height:110px;flex:1;"></div>' for _ in range(5 if kpis else 3))
+    st.markdown(
+        html_block(
+            f"""
+            <style>
+                @keyframes sk-pulse {{ 0% {{opacity:.45}} 50% {{opacity:1}} 100% {{opacity:.45}} }}
+                .sk {{ background:{LINE}; border-radius:14px; animation: sk-pulse 1.4s ease-in-out infinite; }}
+            </style>
+            <div style="display:flex;gap:1rem;margin:0.5rem 0 1rem 0;">{cards}</div>
+            <div style="display:flex;gap:1rem;">
+                <div class="sk" style="height:260px;flex:1;"></div>
+                <div class="sk" style="height:260px;flex:1;"></div>
+            </div>
+            """
+        ),
+        unsafe_allow_html=True,
+    )
 
-overall = load_view("vw_overall_sales_performance")
-yearly = load_view("vw_yearly_performance")
-category = load_view("vw_category_performance")
-product = load_view("vw_product_performance")
-product_names = pd.read_sql(
-    "SELECT product_key, product_name FROM dim_product", engine
-)
-segment = load_view("vw_segment_performance")
-region = load_view("vw_region_performance")
-discount = load_view("vw_discount_profitability")
+
+def render_pipeline_progress():
+    """Which stage of the latest pipeline run is where. Silent if there is no status yet."""
+    try:
+        run = pipeline_status.latest_run(engine)
+    except Exception:
+        return
+    if run is None:
+        return
+    icons = {"success": "✅", "running": "⏳", "failed": "❌"}
+    lines = [
+        f"{icons.get(run['stages'].get(stage, {}).get('status'), '▫️')} {stage}"
+        for stage in pipeline_status.STAGES
+    ]
+    st.caption(f"Latest pipeline run: {run['run_id']}")
+    st.markdown("  \n".join(lines))
+
+
+@st.fragment(run_every=5)
+def poll_until_ready():
+    if check_data_ready()[0]:
+        st.rerun()
+
+
+@st.fragment(run_every=10)
+def poll_forecast():
+    if pipeline_status.forecast_state(engine)[0] != "waiting":
+        st.rerun()
+
+
+data_ready, data_reason = check_data_ready()
+if not data_ready:
+    hero(
+        "Sales Analytics Dashboard",
+        "Business performance, trends and predictions, powered by your data warehouse.",
+        "Waiting for data",
+    )
+    render_skeleton()
+    st.info(data_reason + " This page refreshes by itself as soon as the data is ready.")
+    render_pipeline_progress()
+    poll_until_ready()
+    st.stop()
+
+CACHE_KEY = current_cache_key()
+
+overall = load_view("vw_overall_sales_performance", CACHE_KEY)
+yearly = load_view("vw_yearly_performance", CACHE_KEY)
+category = load_view("vw_category_performance", CACHE_KEY)
+product = load_view("vw_product_performance", CACHE_KEY)
+product_names = load_product_names(CACHE_KEY)
+segment = load_view("vw_segment_performance", CACHE_KEY)
+region = load_view("vw_region_performance", CACHE_KEY)
+discount = load_view("vw_discount_profitability", CACHE_KEY)
 
 total_orders = overall["total_orders"].iloc[0]
 total_quantity = overall["total_quantity"].iloc[0]
@@ -781,11 +881,23 @@ def year_bars(forecast_df, hist_df, col):
 
 
 with tab_prediction:
-    predictions_file = Path(__file__).resolve().parent.parent / "prediction_outputs" / "forecast.csv"
+    # The forecast is shown only when it belongs to the latest pipeline run
+    # (see src/pipeline_status.py), so an old forecast is never presented as current.
+    forecast_status, forecast_info = pipeline_status.forecast_state(engine)
+    predictions_file = pipeline_status.forecast_file()
 
-    if not predictions_file.exists():
-        st.warning("Forecast file not found. Run prediction.py first.")
+    if forecast_status == "waiting":
+        render_skeleton(kpis=False)
+        st.info(forecast_info["reason"] + " This tab refreshes by itself when the forecast is ready.")
+        poll_forecast()
     else:
+        if forecast_status == "ready":
+            st.caption(
+                f"Forecast from pipeline run {forecast_info['run_id']}, "
+                f"generated {forecast_info.get('generated_at', 'unknown')}."
+            )
+        else:
+            st.caption(forecast_info["reason"])
         pred = pd.read_csv(predictions_file)
 
         # ---- Revenue / profit columns --------------------------------

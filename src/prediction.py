@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -6,7 +7,7 @@ import pandas as pd
 
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, avg, when
+from pyspark.sql.functions import col, avg, when, lit, greatest
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
 from pyspark.ml.regression import GBTRegressor
@@ -151,8 +152,8 @@ assembler = VectorAssembler(
 gbt = GBTRegressor(
     featuresCol="features",
     labelCol="sales",
-    maxIter=30,
-    maxDepth=5,
+    maxIter=60,
+    maxDepth=8,
     seed=42,
 )
 
@@ -164,20 +165,55 @@ print("Model trained successfully!")
 
 predictions = model.transform(test_data)
 
-rmse = RegressionEvaluator(
-    labelCol="sales", predictionCol="prediction", metricName="rmse"
-).evaluate(predictions)
 
-mae = RegressionEvaluator(
-    labelCol="sales", predictionCol="prediction", metricName="mae"
-).evaluate(predictions)
+def evaluate(frame, prediction_col):
+    return {
+        name: float(
+            RegressionEvaluator(
+                labelCol="sales", predictionCol=prediction_col, metricName=name
+            ).evaluate(frame)
+        )
+        for name in ("rmse", "mae", "r2")
+    }
 
-r2 = RegressionEvaluator(
-    labelCol="sales", predictionCol="prediction", metricName="r2"
-).evaluate(predictions)
+
+# GBT on its own, kept for comparison with the hybrid result below.
+gbt_only = evaluate(predictions, "prediction")
+
+# In this data a product has one fixed price, so
+#     sales = price * quantity * (1 - discount)
+# holds exactly for every product the model has already seen. A tree model
+# approximates that product poorly, so for products that appear in the training
+# data the price is applied directly; the GBT is used only for products that
+# were not in the training data. The prices come from the training rows only.
+list_price = when(
+    (col("quantity") > 0) & (col("discount") < 1),
+    col("sales") / (col("quantity") * (1 - col("discount"))),
+)
+known_prices = (
+    train_data.withColumn("list_price", list_price)
+    .groupBy("product_key")
+    .agg(avg("list_price").alias("known_price"))
+)
+predictions = predictions.join(known_prices, on="product_key", how="left")
+predictions = predictions.withColumn(
+    "prediction",
+    when(
+        col("known_price").isNotNull(),
+        col("known_price") * col("quantity") * (1 - col("discount")),
+    ).otherwise(greatest(col("prediction"), lit(0.0))),
+)
+known_share = float(predictions.filter(col("known_price").isNotNull()).count()) / predictions.count()
+
+hybrid = evaluate(predictions, "prediction")
+rmse, mae, r2 = hybrid["rmse"], hybrid["mae"], hybrid["r2"]
 
 
-output_dir = Path(__file__).resolve().parent.parent / "prediction_outputs"
+# PREDICTION_OUTPUT_DIR lets the Docker worker and the dashboard share one folder.
+output_dir = Path(
+    os.getenv("PREDICTION_OUTPUT_DIR")
+    or Path(__file__).resolve().parent.parent / "prediction_outputs"
+)
 output_dir.mkdir(parents=True, exist_ok=True)
 
 prediction_pdf = predictions.select(
@@ -191,7 +227,16 @@ prediction_pdf = prediction_pdf.rename(columns={
 
 prediction_pdf.to_csv(output_dir / "predictions.csv", index=False)
 
-metrics = {"rmse": float(rmse), "mae": float(mae), "r2": float(r2)}
+metrics = {
+    "rmse": float(rmse),
+    "mae": float(mae),
+    "r2": float(r2),
+    # for comparison: the GBT model alone, and how many test rows were products seen in training
+    "gbt_only_rmse": gbt_only["rmse"],
+    "gbt_only_mae": gbt_only["mae"],
+    "gbt_only_r2": gbt_only["r2"],
+    "known_product_share": known_share,
+}
 
 with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
     json.dump(metrics, f, indent=4)
@@ -202,6 +247,8 @@ print("===================================")
 print(f"RMSE: {rmse:.2f}")
 print(f"MAE:  {mae:.2f}")
 print(f"R2:   {r2:.4f}")
+print(f"(GBT alone: R2 {gbt_only['r2']:.4f}, RMSE {gbt_only['rmse']:.2f}, MAE {gbt_only['mae']:.2f}; "
+      f"{known_share:.1%} of test rows were products seen in training)")
 
 
 # ======================================================================

@@ -1,0 +1,13 @@
+.env
+.git
+logs
+data
+prediction_outputs
+ml_outputs
+__pycache__
+*.pyc
+*.zip
+*.sql.bak
+sales_dwh_backup.sql
+docs
+backups
