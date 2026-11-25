@@ -133,7 +133,7 @@ flowchart LR
 The DAG `salesflow_pipeline` has no schedule (the source is a CSV file), runs one instance at a time, and has no automatic retries because the source load drops and recreates tables.
 
 <p>
-  <img src="docs/images/Neon Airflow Salesflow Pipeline Dashboard.png" alt="SalesFlow Architecture" width="80%">
+  <img src="docs/images/Neon Airflow Salesflow Pipeline Dashboard.png" alt="SalesFlow Architecture" width="90%">
 </p>
 
 | Task | What it does |
